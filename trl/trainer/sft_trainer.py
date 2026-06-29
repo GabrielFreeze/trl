@@ -20,9 +20,11 @@ import warnings
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
+from itertools import chain
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -421,7 +423,7 @@ def _packed_t5_attention_mask(
 
 
 def _patch_t5_seq2seq_forward(model: torch.nn.Module, chunk_size: int | None = None) -> None:
-    """Patch a T5-family model for packed seq2seq attention and optional chunked cross-entropy."""
+    """Patch a T5 model for packed seq2seq attention and optional chunked cross-entropy."""
     original_forward = model.forward
     lm_head = model.get_output_embeddings()
 
@@ -602,6 +604,57 @@ def get_dataset_column_names(dataset: Dataset | IterableDataset) -> list[str]:
     return list(next(iter(dataset)).keys()) if dataset.column_names is None else dataset.column_names
 
 
+def _compute_t5_span_corruption_lengths(
+    input_length: int, noise_density: float, mean_noise_span_length: float
+) -> tuple[int, int]:
+    """Compute the raw-token and target lengths used by the canonical T5 span-corruption objective."""
+    if input_length < 2:
+        raise ValueError("T5 span corruption requires `max_length` to be at least 2.")
+    if not 0.0 < noise_density <= 0.5:
+        raise ValueError("`t5_noise_density` must be greater than 0 and at most 0.5.")
+    if mean_noise_span_length < 1.0:
+        raise ValueError("`t5_mean_noise_span_length` must be at least 1.0.")
+
+    def _corrupted_lengths(tokens_length: int) -> tuple[int, int]:
+        num_noise_tokens = int(round(tokens_length * noise_density))
+        num_noise_tokens = min(max(num_noise_tokens, 1), tokens_length - 1)
+        num_nonnoise_tokens = tokens_length - num_noise_tokens
+        num_noise_spans = max(int(round(min(num_noise_tokens, num_nonnoise_tokens) / mean_noise_span_length)), 1)
+        return num_nonnoise_tokens + num_noise_spans + 1, num_noise_tokens + num_noise_spans + 1
+
+    tokens_length = input_length
+    while _corrupted_lengths(tokens_length + 1)[0] <= input_length:
+        tokens_length += 1
+
+    corrupted_input_length, target_length = _corrupted_lengths(tokens_length)
+    if noise_density == 0.5 and target_length > corrupted_input_length:
+        tokens_length -= 1
+        target_length -= 1
+    return tokens_length, target_length
+
+
+def _get_t5_sentinel_token_ids(tokenizer: PreTrainedTokenizerBase) -> list[int]:
+    """Return T5 sentinel IDs in objective order, including mT5's SentencePiece-prefixed sentinels."""
+    vocabulary = tokenizer.get_vocab()
+    sentinel_token_ids = []
+    sentinel_index = 0
+    while True:
+        token = f"<extra_id_{sentinel_index}>"
+        if token in vocabulary:
+            sentinel_token_ids.append(vocabulary[token])
+        elif f"▁{token}" in vocabulary:
+            sentinel_token_ids.append(vocabulary[f"▁{token}"])
+        else:
+            break
+        sentinel_index += 1
+    if not sentinel_token_ids:
+        raise ValueError(
+            "The tokenizer does not provide T5 sentinel tokens (`<extra_id_0>`, ...), which are required for "
+            "`pretraining_objective='t5_span_corruption'`."
+        )
+    return sentinel_token_ids
+
+
 @dataclass
 class DataCollatorForLanguageModeling(DataCollatorMixin):
     """
@@ -765,6 +818,104 @@ class DataCollatorForLanguageModeling(DataCollatorMixin):
         position_ids = position_ids.cumsum(0)
         # Split back into one tensor per example
         return list(position_ids.split(example_lengths))
+
+
+@dataclass
+class DataCollatorForT5SpanCorruption(DataCollatorMixin):
+    """Dynamically construct the T5 span-corruption objective from fixed-length raw-token chunks."""
+
+    tokenizer: PreTrainedTokenizerBase
+    noise_density: float
+    mean_noise_span_length: float
+    input_length: int
+    target_length: int
+    expanded_input_length: int
+    sentinel_token_ids: list[int]
+    return_tensors: str = "pt"
+
+    def torch_call(self, examples: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+        if not examples:
+            raise ValueError("T5 span corruption requires at least one example.")
+
+        input_ids = [np.asarray(example["input_ids"], dtype=np.int64) for example in examples]
+        lengths = {len(ids) for ids in input_ids}
+        if lengths != {self.expanded_input_length}:
+            raise ValueError(
+                "T5 span-corruption examples must contain exactly "
+                f"{self.expanded_input_length} raw tokens, but received lengths {sorted(lengths)}."
+            )
+        input_ids = np.stack(input_ids)
+
+        mask_indices = np.stack([self.random_spans_noise_mask(self.expanded_input_length) for _ in examples])
+        input_sentinel_ids = self.create_sentinel_ids(mask_indices)
+        label_sentinel_ids = self.create_sentinel_ids(~mask_indices)
+        corrupted_input_ids = self.filter_input_ids(input_ids, input_sentinel_ids)
+        labels = self.filter_input_ids(input_ids, label_sentinel_ids)
+
+        if corrupted_input_ids.shape[1] != self.input_length:
+            raise ValueError(
+                f"Span corruption produced {corrupted_input_ids.shape[1]} encoder tokens; expected "
+                f"{self.input_length}."
+            )
+        if labels.shape[1] != self.target_length:
+            raise ValueError(
+                f"Span corruption produced {labels.shape[1]} target tokens; expected {self.target_length}."
+            )
+
+        input_ids_tensor = torch.from_numpy(corrupted_input_ids).long()
+        return {
+            "input_ids": input_ids_tensor,
+            "attention_mask": torch.ones_like(input_ids_tensor),
+            "labels": torch.from_numpy(labels).long(),
+        }
+
+    def create_sentinel_ids(self, mask_indices: np.ndarray) -> np.ndarray:
+        """Replace each masked-span start with its sentinel and mark subsequent span tokens for deletion."""
+        previous_mask = np.roll(mask_indices, 1, axis=-1)
+        previous_mask[:, 0] = False
+        span_starts = mask_indices & ~previous_mask
+        span_numbers = np.cumsum(span_starts, axis=-1)
+        num_spans = int(span_numbers.max(initial=0))
+        if num_spans > len(self.sentinel_token_ids):
+            raise ValueError(
+                f"T5 span corruption requires {num_spans} sentinel tokens, but the tokenizer provides only "
+                f"{len(self.sentinel_token_ids)}."
+            )
+
+        sentinel_ids = np.zeros_like(span_numbers, dtype=np.int64)
+        for span_index, token_id in enumerate(self.sentinel_token_ids[:num_spans], start=1):
+            sentinel_ids[span_starts & (span_numbers == span_index)] = token_id
+        sentinel_ids[mask_indices & ~span_starts] = -1
+        return sentinel_ids
+
+    def filter_input_ids(self, input_ids: np.ndarray, sentinel_ids: np.ndarray) -> np.ndarray:
+        """Insert sentinels, remove the remaining selected tokens, and append EOS."""
+        filtered = np.where(sentinel_ids != 0, sentinel_ids, input_ids)
+        filtered = filtered[filtered >= 0].reshape((input_ids.shape[0], -1))
+        eos = np.full((input_ids.shape[0], 1), self.tokenizer.eos_token_id, dtype=np.int64)
+        return np.concatenate([filtered, eos], axis=-1)
+
+    def random_spans_noise_mask(self, length: int) -> np.ndarray:
+        """Sample alternating non-noise and noise spans with the canonical T5 length constraints."""
+        num_noise_tokens = int(round(length * self.noise_density))
+        num_noise_tokens = min(max(num_noise_tokens, 1), length - 1)
+        num_nonnoise_tokens = length - num_noise_tokens
+        num_noise_spans = int(round(min(num_noise_tokens, num_nonnoise_tokens) / self.mean_noise_span_length))
+        num_noise_spans = max(num_noise_spans, 1)
+
+        def _random_segmentation(num_items: int, num_segments: int) -> np.ndarray:
+            first_in_segment = np.arange(num_items - 1) < num_segments - 1
+            np.random.shuffle(first_in_segment)
+            segment_id = np.cumsum(np.pad(first_in_segment, [[1, 0]]))
+            return np.unique(segment_id, return_counts=True)[1]
+
+        noise_span_lengths = _random_segmentation(num_noise_tokens, num_noise_spans)
+        nonnoise_span_lengths = _random_segmentation(num_nonnoise_tokens, num_noise_spans)
+        interleaved_span_lengths = np.stack([nonnoise_span_lengths, noise_span_lengths], axis=1).reshape(-1)
+        span_starts = np.cumsum(interleaved_span_lengths)[:-1]
+        span_start_indicator = np.zeros(length, dtype=np.int8)
+        span_start_indicator[span_starts] = 1
+        return np.cumsum(span_start_indicator) % 2 == 1
 
 
 @dataclass
@@ -1189,7 +1340,8 @@ class SFTTrainer(_BaseTrainer):
 
             The trainer also supports processed datasets (tokenized) as long as they contain an `input_ids` field.
             For seq2seq models, datasets must be prompt-completion datasets, or processed datasets with both
-            `input_ids` and `labels`.
+            `input_ids` and `labels`. T5 and mT5 models can also consume raw text when
+            `pretraining_objective="t5_span_corruption"` is explicitly configured.
         eval_dataset ([`~datasets.Dataset`], [`~datasets.IterableDataset`] or `dict[str, Dataset | IterableDataset]`):
             Dataset to use for evaluation. It must meet the same requirements as `train_dataset`.
         processing_class ([`~transformers.PreTrainedTokenizerBase`], [`~transformers.ProcessorMixin`], *optional*):
@@ -1315,6 +1467,73 @@ class SFTTrainer(_BaseTrainer):
             raise TypeError("The `processing_class` must be either a `PreTrainedTokenizerBase` or a `ProcessorMixin`")
         self._is_encoder_decoder = getattr(model.config, "is_encoder_decoder", False)
         self._is_t5_seq2seq = self._is_encoder_decoder and model.config.model_type == "t5"
+        self._supports_t5_span_corruption = self._is_encoder_decoder and model.config.model_type in {"mt5", "t5"}
+        self._t5_span_corruption_expanded_input_length = None
+        self._t5_span_corruption_target_length = None
+
+        if args.pretraining_objective not in {None, "t5_span_corruption"}:
+            raise ValueError(
+                f"Unsupported pretraining objective: {args.pretraining_objective!r}. The only supported value is "
+                "'t5_span_corruption'."
+            )
+        if args.pretraining_objective == "t5_span_corruption":
+            if not self._supports_t5_span_corruption:
+                raise ValueError(
+                    "`pretraining_objective='t5_span_corruption'` is supported only for T5 and mT5 models."
+                )
+            if args.max_length is None:
+                raise ValueError("T5 span corruption requires a finite `max_length`.")
+            if args.packing:
+                raise ValueError(
+                    "T5 span corruption already concatenates and splits raw tokens into full-length examples; "
+                    "`packing=True` is not supported with this pretraining objective."
+                )
+            if args.completion_only_loss:
+                raise ValueError("T5 span corruption is incompatible with `completion_only_loss=True`.")
+            if args.assistant_only_loss:
+                raise ValueError("T5 span corruption is incompatible with `assistant_only_loss=True`.")
+            if args.pad_to_multiple_of is not None:
+                raise ValueError(
+                    "T5 span corruption produces exact fixed-length inputs and does not support `pad_to_multiple_of`."
+                )
+            if args.dataset_kwargs is not None and args.dataset_kwargs.get("skip_prepare_dataset", False):
+                raise ValueError(
+                    "T5 span corruption requires dataset preparation; remove "
+                    "`dataset_kwargs={'skip_prepare_dataset': True}`."
+                )
+            if data_collator is not None:
+                raise ValueError(
+                    "A custom data collator cannot be combined with `pretraining_objective='t5_span_corruption'`. "
+                    "Remove the objective if the custom collator implements its own corruption."
+                )
+            if self._tokenizer.eos_token_id is None:
+                raise ValueError("T5 span corruption requires an EOS token in the tokenizer.")
+
+            expanded_input_length, target_length = _compute_t5_span_corruption_lengths(
+                args.max_length, args.t5_noise_density, args.t5_mean_noise_span_length
+            )
+            if args.max_target_length is not None and target_length > args.max_target_length:
+                raise ValueError(
+                    "The configured T5 span-corruption objective produces "
+                    f"{target_length} target tokens, which exceeds `max_target_length={args.max_target_length}`. "
+                    "Increase `max_target_length` or leave it unset."
+                )
+            sentinel_token_ids = _get_t5_sentinel_token_ids(self._tokenizer)
+            num_noise_tokens = int(round(expanded_input_length * args.t5_noise_density))
+            num_nonnoise_tokens = expanded_input_length - num_noise_tokens
+            num_noise_spans = max(
+                int(round(min(num_noise_tokens, num_nonnoise_tokens) / args.t5_mean_noise_span_length)), 1
+            )
+            if num_noise_spans > len(sentinel_token_ids):
+                raise ValueError(
+                    f"T5 span corruption requires {num_noise_spans} sentinel tokens at `max_length={args.max_length}`, "
+                    f"but the tokenizer provides only {len(sentinel_token_ids)}."
+                )
+            if max(sentinel_token_ids[:num_noise_spans]) >= model.get_input_embeddings().num_embeddings:
+                raise ValueError("The tokenizer's T5 sentinel IDs are outside the model input embedding vocabulary.")
+            self._t5_span_corruption_expanded_input_length = expanded_input_length
+            self._t5_span_corruption_target_length = target_length
+            self._t5_span_corruption_sentinel_token_ids = sentinel_token_ids
 
         if args.eos_token is not None:
             if args.eos_token not in self._tokenizer.get_vocab():
@@ -1361,7 +1580,7 @@ class SFTTrainer(_BaseTrainer):
             )
         if self._is_encoder_decoder:
             if args.packing and not self._is_t5_seq2seq:
-                raise ValueError("Seq2seq packing is currently supported only for T5-family models.")
+                raise ValueError("Seq2seq packing is currently supported only for T5 models, including Aya.")
             if args.packing and Version(transformers.__version__) < Version("5.0.0"):
                 raise ValueError("T5 seq2seq packing requires `transformers>=5.0.0`.")
             if args.packing and args.packing_strategy != "bfd":
@@ -1374,7 +1593,7 @@ class SFTTrainer(_BaseTrainer):
                 )
             if args.loss_type == "chunked_nll" and not self._is_t5_seq2seq:
                 logger.warning(
-                    "`loss_type='chunked_nll'` is currently supported only for causal and T5-family models. Using "
+                    "`loss_type='chunked_nll'` is currently supported only for causal and T5 models. Using "
                     "`loss_type='nll'` for this seq2seq model."
                 )
                 args.loss_type = "nll"
@@ -1520,7 +1739,9 @@ class SFTTrainer(_BaseTrainer):
         # Decide whether to use completion-only loss: if not specified, then it is set to True if the dataset format
         # is prompt-completion, and False if the dataset format is language modeling.
         dataset_sample = next(iter(train_dataset))
-        if args.completion_only_loss is None:
+        if args.pretraining_objective == "t5_span_corruption":
+            self.completion_only_loss = False
+        elif args.completion_only_loss is None:
             self.completion_only_loss = "prompt" in dataset_sample and "completion" in dataset_sample
         else:
             self.completion_only_loss = args.completion_only_loss
@@ -1543,7 +1764,17 @@ class SFTTrainer(_BaseTrainer):
                     "in the vocabulary before using it as a padding token."
                 )
             self._tokenizer.pad_token = pad_token
-            if self._is_encoder_decoder:
+            if args.pretraining_objective == "t5_span_corruption":
+                data_collator = DataCollatorForT5SpanCorruption(
+                    tokenizer=self._tokenizer,
+                    noise_density=args.t5_noise_density,
+                    mean_noise_span_length=args.t5_mean_noise_span_length,
+                    input_length=args.max_length,
+                    target_length=self._t5_span_corruption_target_length,
+                    expanded_input_length=self._t5_span_corruption_expanded_input_length,
+                    sentinel_token_ids=self._t5_span_corruption_sentinel_token_ids,
+                )
+            elif self._is_encoder_decoder:
                 if model.config.decoder_start_token_id is None:
                     raise ValueError("Seq2seq models require `decoder_start_token_id` in the model config.")
                 data_collator = DataCollatorForSeq2SeqLanguageModeling(
@@ -1804,6 +2035,98 @@ class SFTTrainer(_BaseTrainer):
             return {k: v[0] for k, v in result.items()}
         return result
 
+    def _prepare_t5_span_corruption_dataset(
+        self,
+        dataset: Dataset | IterableDataset,
+        processing_class: PreTrainedTokenizerBase,
+        args: SFTConfig,
+        formatting_func: Callable[[dict], str] | None,
+        dataset_name: str,
+    ) -> Dataset | IterableDataset:
+        """Tokenize and group a raw corpus for dynamic T5 span corruption in the data collator."""
+        map_kwargs = {}
+        if isinstance(dataset, Dataset):
+            map_kwargs["num_proc"] = args.dataset_num_proc
+
+        column_names = get_dataset_column_names(dataset)
+        if "labels" in column_names:
+            raise ValueError(
+                "`pretraining_objective='t5_span_corruption'` expects raw text or tokenized raw `input_ids`, not "
+                "a dataset that already contains `labels`. Remove the objective to train on existing source-target "
+                "pairs."
+            )
+
+        if formatting_func is not None:
+            if "input_ids" in column_names:
+                raise ValueError(
+                    "A formatting function cannot be applied to an already-tokenized pretraining dataset."
+                )
+            if isinstance(dataset, Dataset):
+                map_kwargs["desc"] = f"Applying formatting function to {dataset_name} dataset"
+
+            def _format(example):
+                return {args.dataset_text_field: formatting_func(example)}
+
+            dataset = dataset.map(_format, batched=False, **map_kwargs)
+            column_names = get_dataset_column_names(dataset)
+
+        if "input_ids" not in column_names:
+            if args.dataset_text_field not in column_names:
+                raise ValueError(
+                    "T5 span corruption requires a raw text column named "
+                    f"`{args.dataset_text_field}` or tokenized `input_ids`."
+                )
+            if isinstance(dataset, Dataset):
+                map_kwargs["desc"] = f"Tokenizing {dataset_name} dataset for T5 span corruption"
+
+            def tokenize_raw_text(examples, processing_class, dataset_text_field):
+                return {
+                    "input_ids": processing_class(
+                        examples[dataset_text_field], add_special_tokens=True, return_attention_mask=False
+                    )["input_ids"]
+                }
+
+            dataset = dataset.map(
+                tokenize_raw_text,
+                batched=True,
+                fn_kwargs={
+                    "processing_class": processing_class,
+                    "dataset_text_field": args.dataset_text_field,
+                },
+                remove_columns=column_names,
+                **map_kwargs,
+            )
+        else:
+            dataset = dataset.select_columns("input_ids")
+
+        if isinstance(dataset, Dataset):
+            map_kwargs["desc"] = f"Grouping {dataset_name} dataset for T5 span corruption"
+
+        def group_texts(examples, expanded_input_length):
+            concatenated_input_ids = list(chain.from_iterable(examples["input_ids"]))
+            total_length = len(concatenated_input_ids) // expanded_input_length * expanded_input_length
+            return {
+                "input_ids": [
+                    concatenated_input_ids[offset : offset + expanded_input_length]
+                    for offset in range(0, total_length, expanded_input_length)
+                ]
+            }
+
+        dataset = dataset.map(
+            group_texts,
+            batched=True,
+            fn_kwargs={"expanded_input_length": self._t5_span_corruption_expanded_input_length},
+            **map_kwargs,
+        )
+        if isinstance(dataset, Dataset) and len(dataset) == 0:
+            raise ValueError(
+                "The dataset does not contain enough tokens to create one T5 span-corruption example of "
+                f"{self._t5_span_corruption_expanded_input_length} raw tokens. Add more text or reduce `max_length`."
+            )
+        if args.shuffle_dataset:
+            dataset = dataset.shuffle(seed=args.seed)
+        return dataset
+
     def _prepare_dataset(
         self,
         dataset: Dataset | IterableDataset,
@@ -1820,6 +2143,11 @@ class SFTTrainer(_BaseTrainer):
                 "into the tokenized columns. Pass `dataset_kwargs={'skip_prepare_dataset': True}` and make the "
                 "transform return trainer-ready examples, including tokenized fields, or materialize deterministic "
                 "transforms with `Dataset.map()` before constructing the trainer."
+            )
+
+        if args.pretraining_objective == "t5_span_corruption":
+            return self._prepare_t5_span_corruption_dataset(
+                dataset, processing_class, args, formatting_func, dataset_name
             )
 
         # If the dataset is already preprocessed (tokenized), skip the processing steps.
@@ -1952,7 +2280,8 @@ class SFTTrainer(_BaseTrainer):
                         if self._is_encoder_decoder:
                             raise ValueError(
                                 "Encoder-decoder models require a prompt-completion dataset with `prompt` and "
-                                "`completion` columns."
+                                "`completion` columns. For T5 pretraining on raw text, set "
+                                "`pretraining_objective='t5_span_corruption'`."
                             )
                         if is_conversational(example):
                             processed = self._tokenize(

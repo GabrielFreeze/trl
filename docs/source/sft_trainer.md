@@ -27,7 +27,7 @@ trainer.train()
 
 ## Expected dataset type and format
 
-SFT supports both [language modeling](dataset_formats#language-modeling) and [prompt-completion](dataset_formats#prompt-completion) datasets for causal language models. For seq2seq encoder-decoder models, such as T5, BART, or Aya, use a prompt-completion dataset: the prompt is used as the encoder input and the completion is used as the decoder target. The [`SFTTrainer`] is compatible with both [standard](dataset_formats#standard) and [conversational](dataset_formats#conversational) dataset formats. When provided with a conversational dataset, the trainer will automatically apply the chat template to the dataset.
+SFT supports both [language modeling](dataset_formats#language-modeling) and [prompt-completion](dataset_formats#prompt-completion) datasets for causal language models. For seq2seq encoder-decoder models, such as T5, BART, or Aya, use a prompt-completion dataset: the prompt is used as the encoder input and the completion is used as the decoder target. T5 and mT5 models can additionally use a raw text corpus when the explicit `"t5_span_corruption"` [pretraining objective](#pretrain-t5-models-with-span-corruption) is enabled. The [`SFTTrainer`] is compatible with both [standard](dataset_formats#standard) and [conversational](dataset_formats#conversational) dataset formats. When provided with a conversational dataset, the trainer will automatically apply the chat template to the dataset.
 
 ```python
 # Standard language modeling
@@ -110,7 +110,7 @@ For encoder-decoder models, the same negative log-likelihood objective is comput
 > The paper [On the Generalization of SFT: A Reinforcement Learning Perspective with Reward Rectification](https://huggingface.co/papers/2508.05629) proposes an alternative loss function, called **Dynamic Fine-Tuning (DFT)**, which aims to improve generalization by rectifying the reward signal. For causal language models, this method can be enabled by setting `loss_type="dft"` in the [`SFTConfig`]. For more details, see [Paper Index - Dynamic Fine-Tuning](paper_index#on-the-generalization-of-sft-a-reinforcement-learning-perspective-with-reward-rectification).
 
 > [!TIP]
-> By default, [`SFTTrainer`] uses `loss_type="chunked_nll"`: same math as `"nll"`, but the `lm_head` projection skips ignored-label tokens and the cross-entropy is processed in chunks, so peak activation memory does not scale with the full vocab × seq_len logits tensor. This path supports causal language models and T5-family seq2seq models. To fall back to the standard path, set `loss_type="nll"`. When `use_liger_kernel=True`, the default automatically resolves to `"nll"` (the two paths are not compatible). Other encoder-decoder families use `"nll"`. See [Chunked cross-entropy for reducing peak memory usage](reducing_memory_usage#chunked-cross-entropy-for-reducing-peak-memory-usage).
+> By default, [`SFTTrainer`] uses `loss_type="chunked_nll"`: same math as `"nll"`, but the `lm_head` projection skips ignored-label tokens and the cross-entropy is processed in chunks, so peak activation memory does not scale with the full vocab × seq_len logits tensor. This path supports causal language models and T5 seq2seq models, including Aya. To fall back to the standard path, set `loss_type="nll"`. When `use_liger_kernel=True`, the default automatically resolves to `"nll"` (the two paths are not compatible). Other encoder-decoder families use `"nll"`. See [Chunked cross-entropy for reducing peak memory usage](reducing_memory_usage#chunked-cross-entropy-for-reducing-peak-memory-usage).
 
 ### Label shifting and masking
 
@@ -234,11 +234,42 @@ trainer = SFTTrainer(
 trainer.train()
 ```
 
-For processed datasets, seq2seq examples must contain both `input_ids` and `labels`. Language modeling datasets with only a `"text"` or `"messages"` column are not supported because they do not define a separate decoder target. T5 pretraining on raw text first applies a denoising objective, such as span corruption, that creates these two streams; apply that transformation before passing the dataset to the trainer.
+For processed datasets, seq2seq examples must contain both `input_ids` and `labels`. A raw text column does not otherwise define a decoder target and is rejected unless the explicit T5 span-corruption objective is enabled.
 
-Packing is supported for T5-family models, including Aya, with Transformers 5.0 or newer and `packing_strategy="bfd"`. Source-target pairs remain aligned while the encoder and decoder streams are packed to `max_length` and `max_target_length`, respectively. The trainer uses block-diagonal encoder, decoder, and cross-attention masks, so packed examples cannot attend to one another. This is dense masked attention rather than padding-free or varlen execution; benchmark it for the intended sequence-length distribution because packing can increase attention work. Packed evaluation is not supported and defaults to disabled for seq2seq models.
+#### Pretrain T5 models with span corruption
 
-`loss_type="chunked_nll"` is supported for T5-family models and avoids materializing the full target-length by vocabulary logits tensor during training. Other encoder-decoder families use `loss_type="nll"`. Padding-free training, Dynamic Fine-Tuning (`loss_type="dft"`), and Liger kernels remain unsupported for seq2seq models.
+T5 and mT5 pretraining use a denoising objective rather than treating the same text as both source and target. The trainer can construct the standard [T5 span-corruption objective](https://www.jmlr.org/papers/v21/20-074.html) dynamically from a raw text corpus:
+
+```python
+from datasets import load_dataset
+from trl import SFTConfig, SFTTrainer
+
+dataset = load_dataset("text", data_files="corpus.txt", split="train")
+
+trainer = SFTTrainer(
+    model="CohereForAI/aya-101",
+    args=SFTConfig(
+        pretraining_objective="t5_span_corruption",
+        max_length=512,
+        max_target_length=128,
+        t5_noise_density=0.15,
+        t5_mean_noise_span_length=3.0,
+        packing=False,
+    ),
+    train_dataset=dataset,
+)
+trainer.train()
+```
+
+The preparation pipeline tokenizes the corpus, concatenates documents, and splits it into fixed raw-token chunks. The collator samples new noise spans dynamically, replaces each masked span with a matching `<extra_id_n>` sentinel in the encoder input, and places the removed spans in the decoder labels. SentencePiece-prefixed mT5/Aya sentinels are detected automatically.
+
+`max_length` is the exact post-corruption encoder length. The required raw-token chunk length and decoder target length are derived from it and the two corruption parameters; `max_target_length`, when set, is an upper bound and must accommodate the derived target length. Dataset-map batch remainders are dropped rather than padded with artificial corpus tokens.
+
+This objective cannot be combined with `packing`, `completion_only_loss`, `assistant_only_loss`, `pad_to_multiple_of`, a custom data collator, or `skip_prepare_dataset`. Its examples already fill the configured encoder length, and source-target pairs do not exist until dynamic corruption runs in the collator. Corruption is sampled during evaluation as well, so repeated evaluation calls may use different masks.
+
+Packing is supported for T5 models, including Aya, with Transformers 5.0 or newer and `packing_strategy="bfd"`. Source-target pairs remain aligned while the encoder and decoder streams are packed to `max_length` and `max_target_length`, respectively. The trainer uses block-diagonal encoder, decoder, and cross-attention masks, so packed examples cannot attend to one another. This is dense masked attention rather than padding-free or varlen execution; benchmark it for the intended sequence-length distribution because packing can increase attention work. Packed evaluation is not supported and defaults to disabled for seq2seq models.
+
+`loss_type="chunked_nll"` is supported for T5 models, including Aya, and avoids materializing the full target-length by vocabulary logits tensor during training. Other encoder-decoder families use `loss_type="nll"`. Padding-free training, Dynamic Fine-Tuning (`loss_type="dft"`), and Liger kernels remain unsupported for seq2seq models.
 
 ### Train adapters with PEFT
 

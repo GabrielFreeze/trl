@@ -58,6 +58,14 @@ class SFTConfig(_BaseConfig):
 
         dataset_text_field (`str`, *optional*, defaults to `"text"`):
             Name of the column that contains text data in the dataset.
+        pretraining_objective (`str`, *optional*):
+            Explicit pretraining objective to apply to a language-modeling dataset. The only supported value is
+            `"t5_span_corruption"`, which dynamically converts fixed-length raw-token chunks into corrupted encoder
+            inputs and removed-span decoder labels. This objective is supported only for T5 and mT5 models.
+        t5_noise_density (`float`, *optional*, defaults to `0.15`):
+            Fraction of tokens masked by the `"t5_span_corruption"` objective.
+        t5_mean_noise_span_length (`float`, *optional*, defaults to `3.0`):
+            Mean number of tokens in each masked span for the `"t5_span_corruption"` objective.
         dataset_kwargs (`dict[str, Any]`, *optional*):
             Dictionary of optional keyword arguments for the dataset preparation. The only supported key is
             `skip_prepare_dataset`. When the model is a VLM, `skip_prepare_dataset` is automatically treated as `True`
@@ -73,7 +81,9 @@ class SFTConfig(_BaseConfig):
             this value sets the sequence length. For seq2seq models, this is the encoder sequence length.
         max_target_length (`int` or `None`, *optional*):
             Maximum decoder target length for seq2seq models. Defaults to `max_length` when unset. This setting has no
-            effect for causal language models.
+            effect for causal language models. With `pretraining_objective="t5_span_corruption"`, the exact target
+            length is derived from `max_length`, `t5_noise_density`, and `t5_mean_noise_span_length`; an explicitly set
+            value must be large enough for that target.
         truncation_mode (`str`, *optional*, defaults to `"keep_start"`):
             Truncation mode to use when the sequence exceeds `max_length`. The only supported value is
             `"keep_start"`. The `"keep_end"` value is deprecated and will be removed in v2.0.0.
@@ -81,7 +91,7 @@ class SFTConfig(_BaseConfig):
             Whether to shuffle the dataset.
         packing (`bool`, *optional*, defaults to `False`):
             Whether to group multiple sequences into fixed-length blocks to improve computational efficiency and reduce
-            padding. Uses `max_length` to define sequence length. T5-family seq2seq models use `max_length` for the
+            padding. Uses `max_length` to define sequence length. T5 models, including Aya, use `max_length` for the
             encoder stream and `max_target_length` for the decoder stream.
         packing_strategy (`str`, *optional*, defaults to `"bfd"`):
             Strategy for packing sequences. Can be `"bfd"` (best-fit decreasing, truncates overflow), `"bfd_split"`
@@ -114,7 +124,7 @@ class SFTConfig(_BaseConfig):
             `False`, loss is computed on the entire sequence.
         loss_type (`str`, *optional*, defaults to `"chunked_nll"`):
             Type of loss to use. When left unset, it defaults to `"chunked_nll"`, except when `use_liger_kernel=True`,
-            in which case it defaults to `"nll"`. T5-family seq2seq models support `"chunked_nll"`; other
+            in which case it defaults to `"nll"`. T5 seq2seq models, including Aya, support `"chunked_nll"`; other
             encoder-decoder models use `"nll"`. Possible values are:
 
             - `"nll"`: standard negative log-likelihood.
@@ -122,7 +132,7 @@ class SFTConfig(_BaseConfig):
               [this paper](https://huggingface.co/papers/2508.05629).
             - `"chunked_nll"`: same math as `"nll"`, but the `lm_head` projection is computed on non-ignored tokens
               only (positions with `labels == -100` are dropped before the matmul) and the cross-entropy is processed
-              in chunks of tokens to reduce peak activation memory. Supported for causal and T5-family models and not
+              in chunks of tokens to reduce peak activation memory. Supported for causal and T5 models and not
               compatible with `use_liger_kernel`.
 
         activation_offloading (`bool`, *optional*, defaults to `False`):
@@ -193,6 +203,21 @@ class SFTConfig(_BaseConfig):
         default="text",
         metadata={"help": "Name of the column that contains text data in the dataset."},
     )
+    pretraining_objective: str | None = field(
+        default=None,
+        metadata={
+            "help": "Explicit pretraining objective to apply. The only supported value is 't5_span_corruption'.",
+            "choices": ["t5_span_corruption"],
+        },
+    )
+    t5_noise_density: float = field(
+        default=0.15,
+        metadata={"help": "Fraction of tokens masked by the T5 span-corruption objective."},
+    )
+    t5_mean_noise_span_length: float = field(
+        default=3.0,
+        metadata={"help": "Mean number of tokens in each masked span for T5 span corruption."},
+    )
     dataset_kwargs: dict[str, Any] | None = field(
         default=None,
         metadata={
@@ -240,7 +265,7 @@ class SFTConfig(_BaseConfig):
         default=False,
         metadata={
             "help": "Whether to group multiple sequences into fixed-length blocks to improve computational efficiency "
-            "and reduce padding. Uses `max_length` to define sequence length. T5-family seq2seq models use "
+            "and reduce padding. Uses `max_length` to define sequence length. T5 seq2seq models use "
             "`max_length` for the encoder stream and `max_target_length` for the decoder stream."
         },
     )
@@ -303,7 +328,7 @@ class SFTConfig(_BaseConfig):
         default=None,
         metadata={
             "help": "Type of loss to use. When left unset, it defaults to `'chunked_nll'`, except when "
-            "`use_liger_kernel=True`, in which case it defaults to `'nll'`. T5-family seq2seq models support "
+            "`use_liger_kernel=True`, in which case it defaults to `'nll'`. T5 seq2seq models support "
             "`'chunked_nll'`; other encoder-decoder models use `'nll'`. "
             "Possible values are `'nll'` (standard negative log-likelihood), `'dft'` (Dynamic Fine-Tuning, "
             "https://huggingface.co/papers/2508.05629), and `'chunked_nll'` (same math as `'nll'`, but the "

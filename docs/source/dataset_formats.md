@@ -343,7 +343,7 @@ prompt_completion_example = {"prompt": [{"role": "user", "content": "What color 
 
 For examples of prompt-completion datasets, refer to the [Prompt-completion datasets collection](https://huggingface.co/collections/trl-lib/prompt-completion-datasets-677ea2bb20bbb6bdccada216).
 
-For seq2seq encoder-decoder models trained with [`SFTTrainer`], use the prompt-completion format. The `"prompt"` is used as the encoder input and the `"completion"` is used as the decoder target. A raw text corpus must first be transformed into an objective with separate source and target streams, such as T5 span corruption.
+For seq2seq encoder-decoder models trained with [`SFTTrainer`], use the prompt-completion format. The `"prompt"` is used as the encoder input and the `"completion"` is used as the decoder target. For T5 or mT5 pretraining on a raw text corpus, explicitly set `pretraining_objective="t5_span_corruption"`; the trainer then constructs separate corrupted encoder inputs and removed-span decoder targets.
 
 #### Preference
 
@@ -412,7 +412,7 @@ Choosing the right dataset type depends on the task you are working on and the s
 | [`GRPOTrainer`] | [Prompt-only](#prompt-only) |
 | [`RewardTrainer`] | [Preference (implicit prompt recommended)](#preference) |
 | [`RLOOTrainer`] | [Prompt-only](#prompt-only) |
-| [`SFTTrainer`] | [Language modeling](#language-modeling) or [Prompt-completion](#prompt-completion). Encoder-decoder models require [Prompt-completion](#prompt-completion). |
+| [`SFTTrainer`] | [Language modeling](#language-modeling) or [Prompt-completion](#prompt-completion). Encoder-decoder models require [Prompt-completion](#prompt-completion), except for explicit T5 span-corruption pretraining on raw text. |
 | [`experimental.bco.BCOTrainer`] | [Unpaired preference](#unpaired-preference) or [Preference (explicit prompt recommended)](#preference) |
 | [`experimental.cpo.CPOTrainer`] | [Preference (explicit prompt recommended)](#preference) |
 | [`experimental.gkd.GKDTrainer`] | [Prompt-completion](#prompt-completion) |
