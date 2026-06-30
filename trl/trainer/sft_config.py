@@ -37,12 +37,13 @@ class SFTConfig(_BaseConfig):
         > Parameters that control the model
 
         model_init_kwargs (`dict[str, Any]`, *optional*):
-            Keyword arguments for [`~transformers.AutoModelForCausalLM.from_pretrained`], used when the `model`
-            argument of the [`SFTTrainer`] is provided as a string.
+            Keyword arguments for the model's `from_pretrained` method, used when the `model` argument of the
+            [`SFTTrainer`] is provided as a string. Causal language models are loaded with
+            [`~transformers.AutoModelForCausalLM`]; encoder-decoder models are loaded with
+            [`~transformers.AutoModelForSeq2SeqLM`].
         trust_remote_code (`bool`, *optional*, defaults to `False`):
             Whether to allow loading models and tokenizers that ship custom Python code from the Hub. Forwarded to
-            [`~transformers.AutoModelForCausalLM.from_pretrained`] and
-            [`~transformers.AutoProcessor.from_pretrained`].
+            the model's `from_pretrained` method and [`~transformers.AutoProcessor.from_pretrained`].
         router_aux_loss_coef (`float`, *optional*, defaults to `0.001`):
             Coefficient of the load-balancing auxiliary loss. Only has an effect when training a Mixture-of-Experts
             (MoE) model; for other models it does nothing. The auxiliary loss is added to the training loss with this
@@ -57,6 +58,14 @@ class SFTConfig(_BaseConfig):
 
         dataset_text_field (`str`, *optional*, defaults to `"text"`):
             Name of the column that contains text data in the dataset.
+        pretraining_objective (`str`, *optional*):
+            Explicit pretraining objective to apply to a language-modeling dataset. The only supported value is
+            `"t5_span_corruption"`, which dynamically converts fixed-length raw-token chunks into corrupted encoder
+            inputs and removed-span decoder labels. This objective is supported only for T5 and mT5 models.
+        t5_noise_density (`float`, *optional*, defaults to `0.15`):
+            Fraction of tokens masked by the `"t5_span_corruption"` objective.
+        t5_mean_noise_span_length (`float`, *optional*, defaults to `3.0`):
+            Mean number of tokens in each masked span for the `"t5_span_corruption"` objective.
         dataset_kwargs (`dict[str, Any]`, *optional*):
             Dictionary of optional keyword arguments for the dataset preparation. The only supported key is
             `skip_prepare_dataset`. When the model is a VLM, `skip_prepare_dataset` is automatically treated as `True`
@@ -69,7 +78,12 @@ class SFTConfig(_BaseConfig):
         max_length (`int` or `None`, *optional*, defaults to `1024`):
             Maximum length of the tokenized sequence. Sequences longer than `max_length` are truncated from the left
             or right depending on `truncation_mode`. If `None`, no truncation is applied. When packing is enabled,
-            this value sets the sequence length.
+            this value sets the sequence length. For seq2seq models, this is the encoder sequence length.
+        max_target_length (`int` or `None`, *optional*):
+            Maximum decoder target length for seq2seq models. Defaults to `max_length` when unset. This setting has no
+            effect for causal language models. With `pretraining_objective="t5_span_corruption"`, the exact target
+            length is derived from `max_length`, `t5_noise_density`, and `t5_mean_noise_span_length`; an explicitly set
+            value must be large enough for that target.
         truncation_mode (`str`, *optional*, defaults to `"keep_start"`):
             Truncation mode to use when the sequence exceeds `max_length`. The only supported value is
             `"keep_start"`. The `"keep_end"` value is deprecated and will be removed in v2.0.0.
@@ -77,7 +91,8 @@ class SFTConfig(_BaseConfig):
             Whether to shuffle the dataset.
         packing (`bool`, *optional*, defaults to `False`):
             Whether to group multiple sequences into fixed-length blocks to improve computational efficiency and reduce
-            padding. Uses `max_length` to define sequence length.
+            padding. Uses `max_length` to define sequence length. T5 models, including Aya, use `max_length` for the
+            encoder stream and `max_target_length` for the decoder stream.
         packing_strategy (`str`, *optional*, defaults to `"bfd"`):
             Strategy for packing sequences. Can be `"bfd"` (best-fit decreasing, truncates overflow), `"bfd_split"`
             (best-fit decreasing, splits overflow sequences), or `"wrapped"` (aggressive, cuts mid-sequence).
@@ -86,11 +101,12 @@ class SFTConfig(_BaseConfig):
             continuous sequence. This reduces memory usage by eliminating padding overhead. Currently, this is only
             supported with the FlashAttention 2 or 3, which can efficiently handle the flattened batch structure. When
             packing is enabled with strategy `"bfd"`, padding-free is enabled, regardless of the value of this
-            parameter.
+            parameter. Only supported for causal language models.
         pad_to_multiple_of (`int`, *optional*):
             If set, the sequences will be padded to a multiple of this value.
         eval_packing (`bool`, *optional*):
-            Whether to pack the eval dataset. If `None`, uses the same value as `packing`.
+            Whether to pack the eval dataset. If `None`, uses the same value as `packing` for causal models and
+            defaults to `False` for seq2seq models. Packed seq2seq evaluation is not supported.
 
         > Parameters that control the training
 
@@ -99,21 +115,25 @@ class SFTConfig(_BaseConfig):
             only on the completion, which is supported only for [prompt-completion](#prompt-completion) datasets. If
             `False`, loss is computed on the entire sequence. If `None` (default), the behavior depends on the dataset:
             loss is computed on the completion for [prompt-completion](#prompt-completion) datasets, and on the full
-            sequence for [language modeling](#language-modeling) datasets.
+            sequence for [language modeling](#language-modeling) datasets. For encoder-decoder models, prompt tokens
+            are used as encoder inputs and completion tokens are used as decoder labels, so the loss is computed on the
+            completion side.
         assistant_only_loss (`bool`, *optional*, defaults to `False`):
             Whether to compute loss only on the assistant part of the sequence. If set to `True`, loss is computed only
             on the assistant responses, which is supported only for [conversational](#conversational) datasets. If
             `False`, loss is computed on the entire sequence.
         loss_type (`str`, *optional*, defaults to `"chunked_nll"`):
             Type of loss to use. When left unset, it defaults to `"chunked_nll"`, except when `use_liger_kernel=True`,
-            in which case it defaults to `"nll"`. Possible values are:
+            in which case it defaults to `"nll"`. T5 seq2seq models, including Aya, support `"chunked_nll"`; other
+            encoder-decoder models use `"nll"`. Possible values are:
 
             - `"nll"`: standard negative log-likelihood.
             - `"dft"`: Dynamic Fine-Tuning, as described in
               [this paper](https://huggingface.co/papers/2508.05629).
             - `"chunked_nll"`: same math as `"nll"`, but the `lm_head` projection is computed on non-ignored tokens
               only (positions with `labels == -100` are dropped before the matmul) and the cross-entropy is processed
-              in chunks of tokens to reduce peak activation memory. Not compatible with `use_liger_kernel`.
+              in chunks of tokens to reduce peak activation memory. Supported for causal and T5 models and not
+              compatible with `use_liger_kernel`.
 
         activation_offloading (`bool`, *optional*, defaults to `False`):
             Whether to offload the activations to the CPU.
@@ -149,7 +169,7 @@ class SFTConfig(_BaseConfig):
     model_init_kwargs: dict[str, Any] | str | None = field(
         default=None,
         metadata={
-            "help": "Keyword arguments for `AutoModelForCausalLM.from_pretrained`, used when the `model` argument of "
+            "help": "Keyword arguments for the model's `from_pretrained` method, used when the `model` argument of "
             "the `SFTTrainer` is provided as a string."
         },
     )
@@ -165,7 +185,7 @@ class SFTConfig(_BaseConfig):
         default=False,
         metadata={
             "help": "Whether to allow loading models and tokenizers that ship custom Python code from the Hub. "
-            "Forwarded to `AutoModelForCausalLM.from_pretrained` and `AutoProcessor.from_pretrained`."
+            "Forwarded to the model's `from_pretrained` method and `AutoProcessor.from_pretrained`."
         },
     )
     chat_template_path: str | None = field(
@@ -182,6 +202,21 @@ class SFTConfig(_BaseConfig):
     dataset_text_field: str = field(
         default="text",
         metadata={"help": "Name of the column that contains text data in the dataset."},
+    )
+    pretraining_objective: str | None = field(
+        default=None,
+        metadata={
+            "help": "Explicit pretraining objective to apply. The only supported value is 't5_span_corruption'.",
+            "choices": ["t5_span_corruption"],
+        },
+    )
+    t5_noise_density: float = field(
+        default=0.15,
+        metadata={"help": "Fraction of tokens masked by the T5 span-corruption objective."},
+    )
+    t5_mean_noise_span_length: float = field(
+        default=3.0,
+        metadata={"help": "Mean number of tokens in each masked span for T5 span corruption."},
     )
     dataset_kwargs: dict[str, Any] | None = field(
         default=None,
@@ -210,6 +245,10 @@ class SFTConfig(_BaseConfig):
             "is enabled, this value sets the sequence length."
         },
     )
+    max_target_length: int | None = field(
+        default=None,
+        metadata={"help": "Maximum decoder target length for seq2seq models. Defaults to `max_length` when unset."},
+    )
     truncation_mode: str = field(
         default="keep_start",
         metadata={
@@ -226,7 +265,8 @@ class SFTConfig(_BaseConfig):
         default=False,
         metadata={
             "help": "Whether to group multiple sequences into fixed-length blocks to improve computational efficiency "
-            "and reduce padding. Uses `max_length` to define sequence length."
+            "and reduce padding. Uses `max_length` to define sequence length. T5 seq2seq models use "
+            "`max_length` for the encoder stream and `max_target_length` for the decoder stream."
         },
     )
     packing_strategy: str = field(
@@ -245,7 +285,7 @@ class SFTConfig(_BaseConfig):
             "a single continuous sequence. This reduces memory usage by eliminating padding overhead. Currently, this "
             "is only supported with the FlashAttention 2 or 3, which can efficiently handle the flattened batch "
             "structure. When packing is enabled with strategy `'bfd'`, padding-free is enabled, regardless of the "
-            "value of this parameter."
+            "value of this parameter. Only supported for causal language models."
         },
     )
     pad_to_multiple_of: int | None = field(
@@ -254,7 +294,10 @@ class SFTConfig(_BaseConfig):
     )
     eval_packing: bool | None = field(
         default=None,
-        metadata={"help": "Whether to pack the eval dataset. If `None`, uses the same value as `packing`."},
+        metadata={
+            "help": "Whether to pack the eval dataset. If `None`, uses the same value as `packing` for causal "
+            "models and defaults to `False` for seq2seq models. Packed seq2seq evaluation is not supported."
+        },
     )
 
     # Parameters that control the training
@@ -266,7 +309,8 @@ class SFTConfig(_BaseConfig):
                 "computed only on the completion, which is supported only for prompt-completion datasets. If `False`, "
                 "loss is computed on the entire sequence. If `None` (default), the behavior depends on the dataset: "
                 "loss is computed on the completion for prompt-completion datasets, and on the full sequence for "
-                "language modeling datasets."
+                "language modeling datasets. For encoder-decoder models, prompt tokens are used as encoder inputs "
+                "and completion tokens are used as decoder labels."
             )
         },
     )
@@ -284,13 +328,15 @@ class SFTConfig(_BaseConfig):
         default=None,
         metadata={
             "help": "Type of loss to use. When left unset, it defaults to `'chunked_nll'`, except when "
-            "`use_liger_kernel=True`, in which case it defaults to `'nll'`. Possible values are `'nll'` (standard "
-            "negative log-likelihood), `'dft'` (Dynamic Fine-Tuning, https://huggingface.co/papers/2508.05629), and "
-            "`'chunked_nll'` (same math as `'nll'`, but the `lm_head` projection is computed on non-ignored tokens "
-            "only — positions with `labels == -100` are dropped before the matmul — and the cross-entropy is "
-            "processed in chunks of tokens to reduce peak activation memory; not compatible with `use_liger_kernel`; "
-            "the patched `lm_head` path covers standard causal LMs and VLMs whose language model exposes a top-level "
-            "`lm_head`, architectures with a non-standard head are not supported)."
+            "`use_liger_kernel=True`, in which case it defaults to `'nll'`. T5 seq2seq models support "
+            "`'chunked_nll'`; other encoder-decoder models use `'nll'`. "
+            "Possible values are `'nll'` (standard negative log-likelihood), `'dft'` (Dynamic Fine-Tuning, "
+            "https://huggingface.co/papers/2508.05629), and `'chunked_nll'` (same math as `'nll'`, but the "
+            "`lm_head` projection is computed on non-ignored tokens only — positions with `labels == -100` are "
+            "dropped before the matmul — and the cross-entropy is processed in chunks of tokens to reduce peak "
+            "activation memory; not compatible with `use_liger_kernel`; the patched `lm_head` path covers standard "
+            "causal LMs, T5-family models, and VLMs whose language model exposes a top-level `lm_head`; "
+            "architectures with a non-standard head are not supported)."
         },
     )
     activation_offloading: bool = field(

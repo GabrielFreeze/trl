@@ -27,7 +27,7 @@ trainer.train()
 
 ## Expected dataset type and format
 
-SFT supports both [language modeling](dataset_formats#language-modeling) and [prompt-completion](dataset_formats#prompt-completion) datasets. The [`SFTTrainer`] is compatible with both [standard](dataset_formats#standard) and [conversational](dataset_formats#conversational) dataset formats. When provided with a conversational dataset, the trainer will automatically apply the chat template to the dataset.
+SFT supports both [language modeling](dataset_formats#language-modeling) and [prompt-completion](dataset_formats#prompt-completion) datasets for causal language models. For seq2seq encoder-decoder models, such as T5, BART, or Aya, use a prompt-completion dataset: the prompt is used as the encoder input and the completion is used as the decoder target. T5 and mT5 models can additionally use a raw text corpus when the explicit `"t5_span_corruption"` [pretraining objective](#pretrain-t5-models-with-span-corruption) is enabled. The [`SFTTrainer`] is compatible with both [standard](dataset_formats#standard) and [conversational](dataset_formats#conversational) dataset formats. When provided with a conversational dataset, the trainer will automatically apply the chat template to the dataset.
 
 ```python
 # Standard language modeling
@@ -91,7 +91,7 @@ This section breaks down how SFT works in practice, covering the key steps: **pr
 ### Preprocessing and tokenization
 
 During training, each example is expected to contain a **text field** or a **(prompt, completion)** pair, depending on the dataset format. For more details on the expected formats, see [Dataset formats](dataset_formats).
-The [`SFTTrainer`] tokenizes each input using the model's tokenizer. If both prompt and completion are provided separately, they are concatenated before tokenization.
+The [`SFTTrainer`] tokenizes each input using the model's tokenizer. For causal language models, if both prompt and completion are provided separately, they are concatenated before tokenization. For seq2seq models, prompt-completion examples are tokenized as separate source and target sequences.
 
 ### Computing the loss
 
@@ -104,17 +104,20 @@ $$
 $$
   
 where  \\( y_t \\) is the target token at timestep  \\( t \\), and the model is trained to predict the next token given the previous ones. In practice, padding tokens are masked out during loss computation.
+For encoder-decoder models, the same negative log-likelihood objective is computed over the decoder labels, conditioned on the encoder input.
 
 > [!TIP]
-> The paper [On the Generalization of SFT: A Reinforcement Learning Perspective with Reward Rectification](https://huggingface.co/papers/2508.05629) proposes an alternative loss function, called **Dynamic Fine-Tuning (DFT)**, which aims to improve generalization by rectifying the reward signal. This method can be enabled by setting `loss_type="dft"` in the [`SFTConfig`]. For more details, see [Paper Index - Dynamic Fine-Tuning](paper_index#on-the-generalization-of-sft-a-reinforcement-learning-perspective-with-reward-rectification).
+> The paper [On the Generalization of SFT: A Reinforcement Learning Perspective with Reward Rectification](https://huggingface.co/papers/2508.05629) proposes an alternative loss function, called **Dynamic Fine-Tuning (DFT)**, which aims to improve generalization by rectifying the reward signal. For causal language models, this method can be enabled by setting `loss_type="dft"` in the [`SFTConfig`]. For more details, see [Paper Index - Dynamic Fine-Tuning](paper_index#on-the-generalization-of-sft-a-reinforcement-learning-perspective-with-reward-rectification).
 
 > [!TIP]
-> By default, [`SFTTrainer`] uses `loss_type="chunked_nll"`: same math as `"nll"`, but the `lm_head` projection skips ignored-label tokens and the cross-entropy is processed in chunks, so peak activation memory does not scale with the full vocab × seq_len logits tensor. To fall back to the standard path, set `loss_type="nll"`. When `use_liger_kernel=True`, the default automatically resolves to `"nll"` (the two paths are not compatible). See [Chunked cross-entropy for reducing peak memory usage](reducing_memory_usage#chunked-cross-entropy-for-reducing-peak-memory-usage).
+> By default, [`SFTTrainer`] uses `loss_type="chunked_nll"`: same math as `"nll"`, but the `lm_head` projection skips ignored-label tokens and the cross-entropy is processed in chunks, so peak activation memory does not scale with the full vocab × seq_len logits tensor. This path supports causal language models and T5 seq2seq models, including Aya. To fall back to the standard path, set `loss_type="nll"`. When `use_liger_kernel=True`, the default automatically resolves to `"nll"` (the two paths are not compatible). Other encoder-decoder families use `"nll"`. See [Chunked cross-entropy for reducing peak memory usage](reducing_memory_usage#chunked-cross-entropy-for-reducing-peak-memory-usage).
 
 ### Label shifting and masking
 
-During training, the loss is computed using a **one-token shift**: the model is trained to predict each token in the sequence based on all previous tokens. Specifically, the input sequence is shifted right by one position to form the target labels.
+During causal language model training, the loss is computed using a **one-token shift**: the model is trained to predict each token in the sequence based on all previous tokens. Specifically, the input sequence is shifted right by one position to form the target labels.
 Padding tokens (if present) are ignored in the loss computation by applying an ignore index (default: `-100`) to the corresponding positions. This ensures that the loss focuses only on meaningful, non-padding tokens.
+
+For encoder-decoder models, the trainer passes the completion tokens as `labels`; the model prepares decoder inputs from those labels internally. The trainer does not concatenate the prompt and completion into one causal sequence for encoder-decoder training.
 
 ## Logged metrics
 
@@ -133,7 +136,7 @@ While training and evaluating we record the following reward metrics:
 
 ### Model initialization
 
-You can directly pass the kwargs of the [`~transformers.AutoModelForCausalLM.from_pretrained()`] method to the [`SFTConfig`]. For example, if you want to load a model in a different precision, analogous to
+You can directly pass the kwargs of the model's `from_pretrained()` method to the [`SFTConfig`]. For example, if you want to load a causal language model in a different precision, analogous to
 
 ```python
 model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-0.6B", dtype=torch.bfloat16)
@@ -149,7 +152,7 @@ training_args = SFTConfig(
 )
 ```
 
-Note that all keyword arguments of [`~transformers.AutoModelForCausalLM.from_pretrained()`] are supported.
+Note that all keyword arguments of the resolved model architecture are supported. Causal language models are loaded with [`~transformers.AutoModelForCausalLM`]; encoder-decoder models are loaded with [`~transformers.AutoModelForSeq2SeqLM`].
 
 ### Packing
 
@@ -160,6 +163,9 @@ training_args = SFTConfig(packing=True)
 ```
 
 For more details on packing, see [Packing](reducing_memory_usage#packing).
+
+> [!WARNING]
+> Packing is supported only for causal language models. Encoder-decoder models do not support `packing=True`, `eval_packing=True`, or `padding_free=True`.
 
 ### Train on assistant messages only
 
@@ -197,6 +203,73 @@ trainer.train()
 
 > [!TIP]
 > Training on completion only is compatible with training on assistant messages only. In this case, use a [conversational](dataset_formats#conversational) [prompt-completion](dataset_formats#prompt-completion) dataset and set `assistant_only_loss=True` in the [`SFTConfig`].
+
+For sequence-to-sequence (seq2seq) encoder-decoder models, prompt-completion training always uses the prompt as the encoder input and the completion as the decoder labels. This means the loss is computed on the completion side; `completion_only_loss=False` does not make prompt tokens decoder targets.
+
+### Train sequence-to-sequence models
+
+[`SFTTrainer`] supports encoder-decoder models for seq2seq supervised fine-tuning. Use a [prompt-completion](dataset_formats#prompt-completion) dataset, where `"prompt"` contains the source text and `"completion"` contains the target text.
+
+```python
+from datasets import Dataset
+from trl import SFTConfig, SFTTrainer
+
+dataset = Dataset.from_dict(
+    {
+        "prompt": ["Translate to German: The sky is blue."],
+        "completion": ["Der Himmel ist blau."],
+    }
+)
+
+trainer = SFTTrainer(
+    model="google/flan-t5-small",
+    args=SFTConfig(
+        max_length=1024,
+        max_target_length=256,
+        packing=True,
+        eval_packing=False,
+    ),
+    train_dataset=dataset,
+)
+trainer.train()
+```
+
+For processed datasets, seq2seq examples must contain both `input_ids` and `labels`. A raw text column does not otherwise define a decoder target and is rejected unless the explicit T5 span-corruption objective is enabled.
+
+#### Pretrain T5 models with span corruption
+
+T5 and mT5 pretraining use a denoising objective rather than treating the same text as both source and target. The trainer can construct the standard [T5 span-corruption objective](https://www.jmlr.org/papers/v21/20-074.html) dynamically from a raw text corpus:
+
+```python
+from datasets import load_dataset
+from trl import SFTConfig, SFTTrainer
+
+dataset = load_dataset("text", data_files="corpus.txt", split="train")
+
+trainer = SFTTrainer(
+    model="CohereForAI/aya-101",
+    args=SFTConfig(
+        pretraining_objective="t5_span_corruption",
+        max_length=512,
+        max_target_length=128,
+        t5_noise_density=0.15,
+        t5_mean_noise_span_length=3.0,
+        packing=False,
+    ),
+    train_dataset=dataset,
+)
+trainer.train()
+```
+
+The preparation pipeline tokenizes the corpus, concatenates documents, and splits it into fixed raw-token chunks. The collator samples new noise spans dynamically, replaces each masked span with a matching `<extra_id_n>` sentinel in the encoder input, and places the removed spans in the decoder labels. SentencePiece-prefixed mT5/Aya sentinels are detected automatically.
+
+`max_length` is the exact post-corruption encoder length. The required raw-token chunk length and decoder target length are derived from it and the two corruption parameters; `max_target_length`, when set, is an upper bound and must accommodate the derived target length. Dataset-map batch remainders are dropped rather than padded with artificial corpus tokens.
+
+This objective cannot be combined with `packing`, `completion_only_loss`, `assistant_only_loss`, `pad_to_multiple_of`, a custom data collator, or `skip_prepare_dataset`. Its examples already fill the configured encoder length, and source-target pairs do not exist until dynamic corruption runs in the collator. Corruption is sampled during evaluation as well, so repeated evaluation calls may use different masks.
+
+Packing is supported for T5 models, including Aya, with `packing_strategy="bfd"`. Source-target pairs remain aligned while the encoder and decoder streams are packed to `max_length` and `max_target_length`, respectively. The trainer uses block-diagonal encoder, decoder, and cross-attention masks, so packed examples cannot attend to one another. Transformers 5.0 and newer accept these masks natively; Transformers 4.56.2 uses a compatibility path with the same attention semantics. This is dense masked attention rather than padding-free or varlen execution; benchmark it for the intended sequence-length distribution because packing can increase attention work. Packed evaluation is not supported and defaults to disabled for seq2seq models.
+
+`loss_type="chunked_nll"` is supported for T5 models, including Aya, and avoids materializing the full target-length by vocabulary logits tensor during training. Other encoder-decoder families use `loss_type="nll"`. Padding-free training, Dynamic Fine-Tuning (`loss_type="dft"`), and Liger kernels remain unsupported for seq2seq models.
 
 ### Train adapters with PEFT
 

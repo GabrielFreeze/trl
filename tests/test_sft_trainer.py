@@ -18,18 +18,24 @@ import json
 import pathlib
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
 import transformers
 from accelerate.utils.memory import release_memory
-from datasets import Dataset, load_dataset
+from datasets import Dataset, IterableDataset, load_dataset
 from packaging.version import Version
 from transformers import (
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
+    AutoModelForSeq2SeqLM,
     AutoTokenizer,
     BitsAndBytesConfig,
+    MT5Config,
+    MT5ForConditionalGeneration,
+    T5Config,
+    T5ForConditionalGeneration,
     TrainingArguments,
 )
 from transformers.testing_utils import backend_empty_cache, torch_device
@@ -38,8 +44,14 @@ from transformers.utils import is_peft_available
 from trl import SFTConfig, SFTTrainer
 from trl.trainer.sft_trainer import (
     DataCollatorForLanguageModeling,
+    DataCollatorForSeq2SeqLanguageModeling,
+    DataCollatorForT5SpanCorruption,
     _chunked_cross_entropy_loss,
+    _compute_t5_span_corruption_lengths,
+    _get_t5_sentinel_token_ids,
+    _packed_t5_attention_mask,
     _patch_chunked_ce_lm_head,
+    _patch_t5_seq2seq_forward,
     dft_loss,
 )
 
@@ -324,6 +336,278 @@ class TestDataCollatorForLanguageModeling(TrlTestCase):
         assert torch.equal(result[1], torch.arange(3))
 
 
+class TestDataCollatorForT5SpanCorruption(TrlTestCase):
+    def test_compute_lengths_matches_t5_reference(self):
+        assert _compute_t5_span_corruption_lengths(512, 0.15, 3.0) == (568, 114)
+
+    @pytest.mark.parametrize(
+        ("input_length", "noise_density", "mean_noise_span_length", "match"),
+        [
+            (1, 0.15, 3.0, "max_length"),
+            (32, 0.0, 3.0, "noise_density"),
+            (32, 0.75, 3.0, "noise_density"),
+            (32, 0.15, 0.5, "mean_noise_span_length"),
+        ],
+    )
+    def test_compute_lengths_rejects_invalid_configuration(
+        self, input_length, noise_density, mean_noise_span_length, match
+    ):
+        with pytest.raises(ValueError, match=match):
+            _compute_t5_span_corruption_lengths(input_length, noise_density, mean_noise_span_length)
+
+    def test_get_sentinel_ids_supports_sentencepiece_prefix(self):
+        tokenizer = MagicMock()
+        tokenizer.get_vocab.return_value = {
+            "<unk>": 2,
+            "▁<extra_id_1>": 100,
+            "▁<extra_id_0>": 101,
+        }
+
+        assert _get_t5_sentinel_token_ids(tokenizer) == [101, 100]
+
+    def test_corruption_reconstructs_original_tokens(self):
+        tokenizer = AutoTokenizer.from_pretrained("trl-internal-testing/tiny-T5ForConditionalGeneration")
+        expanded_input_length, target_length = _compute_t5_span_corruption_lengths(16, 0.15, 3.0)
+        sentinel_token_ids = _get_t5_sentinel_token_ids(tokenizer)
+        collator = DataCollatorForT5SpanCorruption(
+            tokenizer=tokenizer,
+            noise_density=0.15,
+            mean_noise_span_length=3.0,
+            input_length=16,
+            target_length=target_length,
+            expanded_input_length=expanded_input_length,
+            sentinel_token_ids=sentinel_token_ids,
+        )
+        original = list(range(100, 100 + expanded_input_length))
+        np.random.seed(0)
+
+        batch = collator([{"input_ids": original}])
+
+        assert batch["input_ids"].shape == (1, 16)
+        assert batch["labels"].shape == (1, target_length)
+        assert torch.equal(batch["attention_mask"], torch.ones_like(batch["input_ids"]))
+
+        sentinels = set(sentinel_token_ids)
+        target_spans = {}
+        current_sentinel = None
+        for token_id in batch["labels"][0, :-1].tolist():
+            if token_id in sentinels:
+                current_sentinel = token_id
+                target_spans[current_sentinel] = []
+            else:
+                target_spans[current_sentinel].append(token_id)
+
+        reconstructed = []
+        for token_id in batch["input_ids"][0, :-1].tolist():
+            if token_id in sentinels:
+                reconstructed.extend(target_spans[token_id])
+            else:
+                reconstructed.append(token_id)
+        assert reconstructed == original
+
+    def test_rejects_incorrect_raw_chunk_length(self):
+        tokenizer = AutoTokenizer.from_pretrained("trl-internal-testing/tiny-T5ForConditionalGeneration")
+        collator = DataCollatorForT5SpanCorruption(
+            tokenizer=tokenizer,
+            noise_density=0.15,
+            mean_noise_span_length=3.0,
+            input_length=16,
+            target_length=5,
+            expanded_input_length=17,
+            sentinel_token_ids=_get_t5_sentinel_token_ids(tokenizer),
+        )
+
+        with pytest.raises(ValueError, match="exactly 17 raw tokens"):
+            collator([{"input_ids": [1, 2, 3]}])
+
+
+class TestDataCollatorForSeq2SeqLanguageModeling(TrlTestCase):
+    @staticmethod
+    def get_tiny_t5():
+        config = T5Config(
+            vocab_size=64,
+            d_model=32,
+            d_kv=8,
+            d_ff=64,
+            num_layers=2,
+            num_decoder_layers=2,
+            num_heads=4,
+            dropout_rate=0.0,
+            pad_token_id=0,
+            eos_token_id=1,
+            decoder_start_token_id=0,
+        )
+        return T5ForConditionalGeneration(config).eval()
+
+    @staticmethod
+    def get_examples():
+        return [
+            {"input_ids": [5, 6, 7], "labels": [10, 11, 1]},
+            {"input_ids": [8, 9], "labels": [12, 13, 14, 1]},
+        ]
+
+    def test_packed_collation_resets_decoder_inputs(self):
+        collator = DataCollatorForSeq2SeqLanguageModeling(pad_token_id=0, decoder_start_token_id=0)
+        examples = [
+            {
+                "input_ids": [5, 6, 7, 8, 9],
+                "labels": [10, 11, 1, 12, 13, 14, 1],
+                "encoder_seq_lengths": [3, 2],
+                "decoder_seq_lengths": [3, 4],
+            }
+        ]
+
+        result = collator(examples)
+
+        torch.testing.assert_close(result["encoder_segment_ids"], torch.tensor([[1, 1, 1, 2, 2]]))
+        torch.testing.assert_close(result["decoder_segment_ids"], torch.tensor([[1, 1, 1, 2, 2, 2, 2]]))
+        torch.testing.assert_close(result["decoder_input_ids"], torch.tensor([[0, 10, 11, 0, 12, 13, 14]]))
+
+    def test_attention_masks_isolate_corresponding_segments(self):
+        encoder_segments = torch.tensor([[1, 1, 2]])
+        decoder_segments = torch.tensor([[1, 1, 2, 2]])
+
+        encoder_mask = _packed_t5_attention_mask(encoder_segments, encoder_segments, torch.float32)
+        decoder_mask = _packed_t5_attention_mask(decoder_segments, decoder_segments, torch.float32, causal=True)
+        cross_mask = _packed_t5_attention_mask(decoder_segments, encoder_segments, torch.float32)
+
+        torch.testing.assert_close(
+            encoder_mask.eq(0).squeeze(0).squeeze(0),
+            torch.tensor([[True, True, False], [True, True, False], [False, False, True]]),
+        )
+        torch.testing.assert_close(
+            decoder_mask.eq(0).squeeze(0).squeeze(0),
+            torch.tensor(
+                [
+                    [True, False, False, False],
+                    [True, True, False, False],
+                    [False, False, True, False],
+                    [False, False, True, True],
+                ]
+            ),
+        )
+        torch.testing.assert_close(
+            cross_mask.eq(0).squeeze(0).squeeze(0),
+            torch.tensor([[True, True, False], [True, True, False], [False, False, True], [False, False, True]]),
+        )
+
+    def test_packed_forward_matches_unpacked_loss_logits_and_gradients(self):
+        torch.manual_seed(0)
+        unpacked_model = self.get_tiny_t5()
+        packed_model = copy.deepcopy(unpacked_model)
+        unpacked_collator = DataCollatorForSeq2SeqLanguageModeling(pad_token_id=0, decoder_start_token_id=0)
+        packed_collator = DataCollatorForSeq2SeqLanguageModeling(pad_token_id=0, decoder_start_token_id=0)
+        unpacked_batch = unpacked_collator(self.get_examples())
+        packed_batch = packed_collator(
+            [
+                {
+                    "input_ids": [5, 6, 7, 8, 9],
+                    "labels": [10, 11, 1, 12, 13, 14, 1],
+                    "encoder_seq_lengths": [3, 2],
+                    "decoder_seq_lengths": [3, 4],
+                }
+            ]
+        )
+        _patch_t5_seq2seq_forward(packed_model)
+
+        unpacked_output = unpacked_model(**unpacked_batch)
+        packed_output = packed_model(**packed_batch)
+
+        torch.testing.assert_close(unpacked_output.loss, packed_output.loss, atol=1e-6, rtol=1e-6)
+        torch.testing.assert_close(unpacked_output.logits[0, :3], packed_output.logits[0, :3], atol=1e-6, rtol=1e-6)
+        torch.testing.assert_close(unpacked_output.logits[1, :4], packed_output.logits[0, 3:], atol=1e-6, rtol=1e-6)
+
+        unpacked_output.loss.backward()
+        packed_output.loss.backward()
+        for (unpacked_name, unpacked_param), (packed_name, packed_param) in zip(
+            unpacked_model.named_parameters(), packed_model.named_parameters(), strict=True
+        ):
+            assert unpacked_name == packed_name
+            if unpacked_param.grad is not None:
+                torch.testing.assert_close(
+                    unpacked_param.grad, packed_param.grad, atol=2e-6, rtol=2e-5, msg=unpacked_name
+                )
+
+    def test_chunked_seq2seq_loss_matches_standard_loss_and_gradients(self):
+        torch.manual_seed(0)
+        standard_model = self.get_tiny_t5()
+        chunked_model = copy.deepcopy(standard_model)
+        collator = DataCollatorForSeq2SeqLanguageModeling(pad_token_id=0, decoder_start_token_id=0)
+        batch = collator(self.get_examples())
+        _patch_t5_seq2seq_forward(chunked_model, chunk_size=2)
+
+        standard_output = standard_model(**batch)
+        chunked_output = chunked_model(**batch)
+
+        assert chunked_output.logits is None
+        torch.testing.assert_close(standard_output.loss, chunked_output.loss, atol=1e-6, rtol=1e-6)
+        standard_output.loss.backward()
+        chunked_output.loss.backward()
+        for (standard_name, standard_param), (chunked_name, chunked_param) in zip(
+            standard_model.named_parameters(), chunked_model.named_parameters(), strict=True
+        ):
+            assert standard_name == chunked_name
+            if standard_param.grad is not None:
+                torch.testing.assert_close(
+                    standard_param.grad, chunked_param.grad, atol=2e-6, rtol=2e-5, msg=standard_name
+                )
+
+    def test_packed_chunked_seq2seq_loss_matches_packed_standard_loss(self):
+        torch.manual_seed(0)
+        standard_model = self.get_tiny_t5()
+        chunked_model = copy.deepcopy(standard_model)
+        packed_example = {
+            "input_ids": [5, 6, 7, 8, 9],
+            "labels": [10, 11, 1, 12, 13, 14, 1],
+            "encoder_seq_lengths": [3, 2],
+            "decoder_seq_lengths": [3, 4],
+        }
+        collator = DataCollatorForSeq2SeqLanguageModeling(pad_token_id=0, decoder_start_token_id=0)
+        batch = collator([packed_example])
+        _patch_t5_seq2seq_forward(standard_model)
+        _patch_t5_seq2seq_forward(chunked_model, chunk_size=2)
+
+        standard_output = standard_model(**batch)
+        chunked_output = chunked_model(**batch)
+
+        torch.testing.assert_close(standard_output.loss, chunked_output.loss, atol=1e-6, rtol=1e-6)
+        standard_output.loss.backward()
+        chunked_output.loss.backward()
+        for (standard_name, standard_param), (chunked_name, chunked_param) in zip(
+            standard_model.named_parameters(), chunked_model.named_parameters(), strict=True
+        ):
+            assert standard_name == chunked_name
+            if standard_param.grad is not None:
+                torch.testing.assert_close(
+                    standard_param.grad, chunked_param.grad, atol=2e-6, rtol=2e-5, msg=standard_name
+                )
+
+    def test_naive_t5_concatenation_changes_the_objective(self):
+        torch.manual_seed(0)
+        isolated_model = self.get_tiny_t5()
+        naive_model = copy.deepcopy(isolated_model)
+        collator = DataCollatorForSeq2SeqLanguageModeling(pad_token_id=0, decoder_start_token_id=0)
+        batch = collator(
+            [
+                {
+                    "input_ids": [5, 6, 7, 8, 9],
+                    "labels": [10, 11, 1, 12, 13, 14, 1],
+                    "encoder_seq_lengths": [3, 2],
+                    "decoder_seq_lengths": [3, 4],
+                }
+            ]
+        )
+        _patch_t5_seq2seq_forward(isolated_model)
+
+        isolated_loss = isolated_model(**batch).loss
+        naive_batch = {
+            key: value for key, value in batch.items() if key not in {"encoder_segment_ids", "decoder_segment_ids"}
+        }
+        naive_loss = naive_model(**naive_batch).loss
+
+        assert not torch.isclose(isolated_loss, naive_loss, atol=1e-5, rtol=1e-5)
+
+
 class TestSFTTrainer(TrlTestCase):
     def test_init_with_training_arguments(self):
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling", split="train")
@@ -408,6 +692,352 @@ class TestSFTTrainer(TrlTestCase):
         for n, param in previous_trainable_params.items():
             new_param = trainer.model.get_parameter(n)
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
+
+    def test_train_seq2seq_prompt_completion(self):
+        model_id = "trl-internal-testing/tiny-T5ForConditionalGeneration"
+        dataset = Dataset.from_list(
+            [
+                {"prompt": "Translate to German: Hello.", "completion": "Hallo."},
+                {"prompt": "Translate to German: Goodbye.", "completion": "Auf Wiedersehen."},
+            ]
+        )
+
+        training_args = SFTConfig(
+            output_dir=self.tmp_dir,
+            max_steps=1,
+            per_device_train_batch_size=1,
+            gradient_checkpointing=False,
+            bf16=False,
+            report_to="none",
+        )
+        trainer = SFTTrainer(model=model_id, args=training_args, train_dataset=dataset)
+
+        assert trainer.args.loss_type == "chunked_nll"
+        assert trainer.train_dataset[0]["input_ids"] != trainer.train_dataset[0]["labels"]
+
+        trainer.train()
+
+        assert trainer.state.log_history[-1]["train_loss"] is not None
+
+    def test_seq2seq_prompt_completion_builds_decoder_labels(self):
+        model_id = "trl-internal-testing/tiny-T5ForConditionalGeneration"
+        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        model = AutoModelForSeq2SeqLM.from_pretrained(model_id, dtype="float32")
+        dataset = Dataset.from_list([{"prompt": "Translate to German: Hello.", "completion": "Hallo."}])
+
+        training_args = SFTConfig(output_dir=self.tmp_dir, gradient_checkpointing=False, bf16=False, report_to="none")
+        trainer = SFTTrainer(model=model, args=training_args, train_dataset=dataset, processing_class=tokenizer)
+
+        decoded_input = tokenizer.decode(trainer.train_dataset[0]["input_ids"], skip_special_tokens=True)
+        decoded_labels = tokenizer.decode(trainer.train_dataset[0]["labels"], skip_special_tokens=True)
+
+        assert "Translate to German" in decoded_input
+        assert "Translate to German" not in decoded_labels
+        assert "Hallo" in decoded_labels
+
+    @pytest.mark.parametrize("loss_type", ["nll", "chunked_nll"])
+    def test_train_t5_span_corruption_from_raw_text(self, loss_type):
+        model_id = "trl-internal-testing/tiny-T5ForConditionalGeneration"
+        dataset = Dataset.from_list([{"text": "The quick brown fox jumps over the lazy dog. " * 40} for _ in range(4)])
+        eval_dataset = Dataset.from_list([{"text": "Evaluation text for span corruption. " * 20}])
+        training_args = SFTConfig(
+            output_dir=self.tmp_dir,
+            pretraining_objective="t5_span_corruption",
+            max_length=32,
+            max_target_length=8,
+            max_steps=1,
+            per_device_train_batch_size=2,
+            gradient_checkpointing=False,
+            bf16=False,
+            loss_type=loss_type,
+            report_to="none",
+        )
+
+        trainer = SFTTrainer(model=model_id, args=training_args, train_dataset=dataset, eval_dataset=eval_dataset)
+
+        assert isinstance(trainer.data_collator, DataCollatorForT5SpanCorruption)
+        assert trainer.train_dataset.column_names == ["input_ids"]
+        assert all(len(example["input_ids"]) == 34 for example in trainer.train_dataset)
+        batch = trainer.data_collator([trainer.train_dataset[0], trainer.train_dataset[1]])
+        assert batch["input_ids"].shape == (2, 32)
+        assert batch["labels"].shape == (2, 8)
+
+        trainer.train()
+        assert trainer.state.log_history[-1]["train_loss"] is not None
+        assert trainer.evaluate()["eval_loss"] is not None
+
+    def test_t5_span_corruption_accepts_tokenized_raw_text(self):
+        model_id = "trl-internal-testing/tiny-T5ForConditionalGeneration"
+        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        tokenized = tokenizer("Raw pretraining text. " * 80)["input_ids"]
+        dataset = Dataset.from_list([{"input_ids": tokenized}])
+        training_args = SFTConfig(
+            output_dir=self.tmp_dir,
+            pretraining_objective="t5_span_corruption",
+            max_length=16,
+            gradient_checkpointing=False,
+            bf16=False,
+            report_to="none",
+        )
+
+        trainer = SFTTrainer(model=model_id, args=training_args, train_dataset=dataset, processing_class=tokenizer)
+
+        assert trainer.train_dataset.column_names == ["input_ids"]
+        assert all(len(example["input_ids"]) == 17 for example in trainer.train_dataset)
+
+    def test_t5_span_corruption_accepts_iterable_raw_text(self):
+        model_id = "trl-internal-testing/tiny-T5ForConditionalGeneration"
+
+        def generate_examples():
+            for _ in range(4):
+                yield {"text": "Streaming raw pretraining text. " * 80}
+
+        dataset = IterableDataset.from_generator(generate_examples)
+        training_args = SFTConfig(
+            output_dir=self.tmp_dir,
+            pretraining_objective="t5_span_corruption",
+            max_length=16,
+            max_steps=1,
+            gradient_checkpointing=False,
+            bf16=False,
+            report_to="none",
+        )
+
+        trainer = SFTTrainer(model=model_id, args=training_args, train_dataset=dataset)
+
+        assert len(next(iter(trainer.train_dataset))["input_ids"]) == 17
+
+    def test_t5_span_corruption_accepts_formatting_function(self):
+        model_id = "trl-internal-testing/tiny-T5ForConditionalGeneration"
+        dataset = Dataset.from_list(
+            [
+                {"prompt": "Raw prompt text. " * 40, "completion": "Raw completion text. " * 40},
+                {"prompt": "More prompt text. " * 40, "completion": "More completion text. " * 40},
+            ]
+        )
+        training_args = SFTConfig(
+            output_dir=self.tmp_dir,
+            pretraining_objective="t5_span_corruption",
+            max_length=16,
+            gradient_checkpointing=False,
+            bf16=False,
+            report_to="none",
+        )
+
+        trainer = SFTTrainer(
+            model=model_id,
+            args=training_args,
+            train_dataset=dataset,
+            formatting_func=lambda example: example["prompt"] + example["completion"],
+        )
+
+        assert trainer.completion_only_loss is False
+        assert trainer.train_dataset.column_names == ["input_ids"]
+
+    def test_train_mt5_span_corruption(self):
+        tokenizer = AutoTokenizer.from_pretrained("trl-internal-testing/tiny-T5ForConditionalGeneration")
+        model = MT5ForConditionalGeneration(
+            MT5Config(
+                vocab_size=len(tokenizer),
+                d_model=32,
+                d_kv=8,
+                d_ff=64,
+                num_layers=1,
+                num_decoder_layers=1,
+                num_heads=4,
+                dropout_rate=0.0,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                decoder_start_token_id=tokenizer.pad_token_id,
+            )
+        )
+        dataset = Dataset.from_list([{"text": "Multilingual raw pretraining text. " * 80}])
+        training_args = SFTConfig(
+            output_dir=self.tmp_dir,
+            pretraining_objective="t5_span_corruption",
+            max_length=16,
+            max_steps=1,
+            gradient_checkpointing=False,
+            bf16=False,
+            report_to="none",
+        )
+
+        trainer = SFTTrainer(model=model, args=training_args, train_dataset=dataset, processing_class=tokenizer)
+        trainer.train()
+
+        assert trainer.state.log_history[-1]["train_loss"] is not None
+
+    @pytest.mark.parametrize(
+        ("config_overrides", "match"),
+        [
+            ({"packing": True}, "already concatenates"),
+            ({"max_target_length": 7}, "exceeds `max_target_length=7`"),
+            ({"completion_only_loss": True}, "completion_only_loss"),
+            ({"assistant_only_loss": True}, "assistant_only_loss"),
+            ({"dataset_kwargs": {"skip_prepare_dataset": True}}, "requires dataset preparation"),
+        ],
+    )
+    def test_t5_span_corruption_rejects_incompatible_options(self, config_overrides, match):
+        model_id = "trl-internal-testing/tiny-T5ForConditionalGeneration"
+        dataset = Dataset.from_list([{"text": "Raw pretraining text. " * 80}])
+        training_args = SFTConfig(
+            output_dir=self.tmp_dir,
+            pretraining_objective="t5_span_corruption",
+            max_length=32,
+            bf16=False,
+            report_to="none",
+            **config_overrides,
+        )
+
+        with pytest.raises(ValueError, match=match):
+            SFTTrainer(model=model_id, args=training_args, train_dataset=dataset)
+
+    def test_t5_span_corruption_rejects_supervised_pairs(self):
+        model_id = "trl-internal-testing/tiny-T5ForConditionalGeneration"
+        dataset = Dataset.from_list([{"input_ids": [3, 4, 5], "labels": [6, 7]}])
+        training_args = SFTConfig(
+            output_dir=self.tmp_dir,
+            pretraining_objective="t5_span_corruption",
+            max_length=16,
+            bf16=False,
+            report_to="none",
+        )
+
+        with pytest.raises(ValueError, match="already contains `labels`"):
+            SFTTrainer(model=model_id, args=training_args, train_dataset=dataset)
+
+    def test_t5_span_corruption_rejects_non_t5_model(self):
+        dataset = Dataset.from_list([{"text": "Raw pretraining text. " * 80}])
+        training_args = SFTConfig(
+            output_dir=self.tmp_dir,
+            pretraining_objective="t5_span_corruption",
+            max_length=32,
+            bf16=False,
+            report_to="none",
+        )
+
+        with pytest.raises(ValueError, match="only for T5 and mT5 models"):
+            SFTTrainer(
+                model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
+                args=training_args,
+                train_dataset=dataset,
+            )
+
+    def test_train_t5_seq2seq_with_packing(self):
+        model_id = "trl-internal-testing/tiny-T5ForConditionalGeneration"
+        dataset = Dataset.from_list(
+            [
+                {"prompt": "Translate to German: Hello.", "completion": "Hallo."},
+                {"prompt": "Translate to German: Goodbye.", "completion": "Auf Wiedersehen."},
+                {"prompt": "Translate to German: Thanks.", "completion": "Danke."},
+            ]
+        )
+        training_args = SFTConfig(
+            output_dir=self.tmp_dir,
+            packing=True,
+            eval_packing=False,
+            max_length=32,
+            max_target_length=16,
+            max_steps=1,
+            gradient_checkpointing=False,
+            bf16=False,
+            report_to="none",
+        )
+
+        trainer = SFTTrainer(model=model_id, args=training_args, train_dataset=dataset)
+
+        assert "encoder_seq_lengths" in trainer.train_dataset.column_names
+        assert "decoder_seq_lengths" in trainer.train_dataset.column_names
+        trainer.train()
+        assert trainer.state.log_history[-1]["train_loss"] is not None
+
+    def test_seq2seq_rejects_non_t5_packing_strategy(self):
+        model_id = "trl-internal-testing/tiny-T5ForConditionalGeneration"
+        dataset = Dataset.from_list([{"prompt": "Translate to German: Hello.", "completion": "Hallo."}])
+        training_args = SFTConfig(
+            output_dir=self.tmp_dir, packing=True, packing_strategy="wrapped", bf16=False, report_to="none"
+        )
+
+        with pytest.raises(ValueError, match="only supports `packing_strategy='bfd'`"):
+            SFTTrainer(model=model_id, args=training_args, train_dataset=dataset)
+
+    def test_t5_seq2seq_packing_restores_encoder_config(self):
+        model_id = "trl-internal-testing/tiny-T5ForConditionalGeneration"
+        model = AutoModelForSeq2SeqLM.from_pretrained(model_id, dtype="float32")
+        collator = DataCollatorForSeq2SeqLanguageModeling(
+            pad_token_id=model.config.pad_token_id,
+            decoder_start_token_id=model.config.decoder_start_token_id,
+        )
+        batch = collator(
+            [
+                {
+                    "input_ids": [5, 6, 7, 8, 9],
+                    "labels": [10, 11, 1, 12, 13, 14, 1],
+                    "encoder_seq_lengths": [3, 2],
+                    "decoder_seq_lengths": [3, 4],
+                }
+            ]
+        )
+        original_is_decoder = model.encoder.config.is_decoder
+        _patch_t5_seq2seq_forward(model)
+
+        model(**batch)
+
+        assert model.encoder.config.is_decoder is original_is_decoder
+
+    @require_peft
+    def test_train_t5_seq2seq_packing_with_lora_and_gradient_checkpointing(self):
+        model_id = "trl-internal-testing/tiny-T5ForConditionalGeneration"
+        dataset = Dataset.from_list(
+            [
+                {"prompt": "Translate to German: Hello.", "completion": "Hallo."},
+                {"prompt": "Translate to German: Goodbye.", "completion": "Auf Wiedersehen."},
+            ]
+        )
+        training_args = SFTConfig(
+            output_dir=self.tmp_dir,
+            packing=True,
+            eval_packing=False,
+            max_length=32,
+            max_target_length=16,
+            max_steps=1,
+            gradient_checkpointing=True,
+            bf16=False,
+            report_to="none",
+        )
+        peft_config = LoraConfig(
+            task_type=TaskType.SEQ_2_SEQ_LM,
+            target_modules=["q", "v"],
+            r=4,
+            lora_alpha=8,
+        )
+        trainer = SFTTrainer(
+            model=model_id,
+            args=training_args,
+            train_dataset=dataset,
+            peft_config=peft_config,
+        )
+        initial_lora = {
+            name: parameter.detach().clone()
+            for name, parameter in trainer.model.named_parameters()
+            if "lora_" in name and parameter.requires_grad
+        }
+
+        trainer.train()
+
+        assert any(
+            not torch.equal(initial_lora[name], parameter)
+            for name, parameter in trainer.model.named_parameters()
+            if name in initial_lora
+        )
+
+    def test_seq2seq_rejects_eval_packing(self):
+        model_id = "trl-internal-testing/tiny-T5ForConditionalGeneration"
+        dataset = Dataset.from_list([{"prompt": "Translate to German: Hello.", "completion": "Hallo."}])
+        training_args = SFTConfig(output_dir=self.tmp_dir, eval_packing=True, bf16=False, report_to="none")
+
+        with pytest.raises(ValueError, match="Eval packing is not supported"):
+            SFTTrainer(model=model_id, args=training_args, train_dataset=dataset, eval_dataset=dataset)
 
     def test_trust_remote_code(self):
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling", split="train")
