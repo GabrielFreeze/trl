@@ -408,8 +408,9 @@ def _packed_t5_attention_mask(
     key_segment_ids: torch.Tensor,
     dtype: torch.dtype,
     causal: bool = False,
+    additive: bool = True,
 ) -> torch.Tensor:
-    """Build a dense additive T5 attention mask that isolates packed segments."""
+    """Build a dense T5 attention mask that isolates packed segments."""
     allowed = query_segment_ids.unsqueeze(-1) == key_segment_ids.unsqueeze(-2)
     allowed = allowed & (query_segment_ids.unsqueeze(-1) != 0) & (key_segment_ids.unsqueeze(-2) != 0)
     if causal:
@@ -417,9 +418,30 @@ def _packed_t5_attention_mask(
         key_positions = torch.arange(key_segment_ids.size(1), device=key_segment_ids.device).view(1, 1, -1)
         allowed = allowed & (key_positions <= query_positions)
 
+    if not additive:
+        return allowed
+
     mask = torch.zeros(allowed.shape, device=allowed.device, dtype=dtype)
     mask.masked_fill_(~allowed, torch.finfo(dtype).min)
     return mask.unsqueeze(1)
+
+
+@contextlib.contextmanager
+def _use_4d_t5_encoder_attention_mask(encoder: torch.nn.Module):
+    """Route a precomputed 4D mask through the Transformers 4.x T5 encoder stack."""
+    if Version(transformers.__version__) >= Version("5.0.0"):
+        yield
+        return
+
+    # Transformers 4.x only preserves a precomputed 4D mask in the decoder mask branch. The supplied mask is already
+    # bidirectional, so selecting that branch does not make encoder attention causal. Transformers 5.x handles 4D
+    # encoder masks natively and does not use this compatibility path.
+    is_decoder = encoder.config.is_decoder
+    encoder.config.is_decoder = True
+    try:
+        yield
+    finally:
+        encoder.config.is_decoder = is_decoder
 
 
 def _patch_t5_seq2seq_forward(model: torch.nn.Module, chunk_size: int | None = None) -> None:
@@ -450,8 +472,6 @@ def _patch_t5_seq2seq_forward(model: torch.nn.Module, chunk_size: int | None = N
         is_packed = encoder_segment_ids is not None or decoder_segment_ids is not None
         if (encoder_segment_ids is None) != (decoder_segment_ids is None):
             raise ValueError("Packed T5 inputs require both `encoder_segment_ids` and `decoder_segment_ids`.")
-        if is_packed and Version(transformers.__version__) < Version("5.0.0"):
-            raise ValueError("Packed T5 training requires `transformers>=5.0.0`.")
 
         # Labels-free calls retain the model's native behavior, including generation and logits post-processing.
         if labels is None:
@@ -503,20 +523,39 @@ def _patch_t5_seq2seq_forward(model: torch.nn.Module, chunk_size: int | None = N
             decoder_attention_mask = _packed_t5_attention_mask(
                 decoder_segment_ids, decoder_segment_ids, mask_dtype, causal=True
             )
-            cross_attention_mask = _packed_t5_attention_mask(decoder_segment_ids, encoder_segment_ids, mask_dtype)
+            # Transformers 4.x converts a 3D binary cross-attention mask to the same additive 4D mask that
+            # Transformers 5.x accepts directly.
+            cross_attention_mask = _packed_t5_attention_mask(
+                decoder_segment_ids,
+                encoder_segment_ids,
+                mask_dtype,
+                additive=Version(transformers.__version__) >= Version("5.0.0"),
+            )
         else:
             encoder_attention_mask = attention_mask
             cross_attention_mask = attention_mask
 
         if encoder_outputs is None:
-            encoder_outputs = self.encoder(
-                input_ids=input_ids,
-                attention_mask=encoder_attention_mask,
-                inputs_embeds=inputs_embeds,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=True,
-            )
+            if is_packed and Version(transformers.__version__) < Version("5.0.0"):
+                with _use_4d_t5_encoder_attention_mask(self.encoder):
+                    encoder_outputs = self.encoder(
+                        input_ids=input_ids,
+                        attention_mask=encoder_attention_mask,
+                        inputs_embeds=inputs_embeds,
+                        use_cache=False,
+                        output_attentions=output_attentions,
+                        output_hidden_states=output_hidden_states,
+                        return_dict=True,
+                    )
+            else:
+                encoder_outputs = self.encoder(
+                    input_ids=input_ids,
+                    attention_mask=encoder_attention_mask,
+                    inputs_embeds=inputs_embeds,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=True,
+                )
         elif not isinstance(encoder_outputs, BaseModelOutput):
             encoder_outputs = BaseModelOutput(
                 last_hidden_state=encoder_outputs[0],
@@ -1581,8 +1620,6 @@ class SFTTrainer(_BaseTrainer):
         if self._is_encoder_decoder:
             if args.packing and not self._is_t5_seq2seq:
                 raise ValueError("Seq2seq packing is currently supported only for T5 models, including Aya.")
-            if args.packing and Version(transformers.__version__) < Version("5.0.0"):
-                raise ValueError("T5 seq2seq packing requires `transformers>=5.0.0`.")
             if args.packing and args.packing_strategy != "bfd":
                 raise ValueError("T5 seq2seq packing only supports `packing_strategy='bfd'`.")
             if args.eval_packing:

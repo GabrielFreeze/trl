@@ -492,7 +492,6 @@ class TestDataCollatorForSeq2SeqLanguageModeling(TrlTestCase):
             torch.tensor([[True, True, False], [True, True, False], [False, False, True], [False, False, True]]),
         )
 
-    @pytest.mark.skipif(Version(transformers.__version__) < Version("5.0.0"), reason="T5 packing requires v5 masks")
     def test_packed_forward_matches_unpacked_loss_logits_and_gradients(self):
         torch.manual_seed(0)
         unpacked_model = self.get_tiny_t5()
@@ -554,7 +553,6 @@ class TestDataCollatorForSeq2SeqLanguageModeling(TrlTestCase):
                     standard_param.grad, chunked_param.grad, atol=2e-6, rtol=2e-5, msg=standard_name
                 )
 
-    @pytest.mark.skipif(Version(transformers.__version__) < Version("5.0.0"), reason="T5 packing requires v5 masks")
     def test_packed_chunked_seq2seq_loss_matches_packed_standard_loss(self):
         torch.manual_seed(0)
         standard_model = self.get_tiny_t5()
@@ -585,7 +583,6 @@ class TestDataCollatorForSeq2SeqLanguageModeling(TrlTestCase):
                     standard_param.grad, chunked_param.grad, atol=2e-6, rtol=2e-5, msg=standard_name
                 )
 
-    @pytest.mark.skipif(Version(transformers.__version__) < Version("5.0.0"), reason="T5 packing requires v5 masks")
     def test_naive_t5_concatenation_changes_the_objective(self):
         torch.manual_seed(0)
         isolated_model = self.get_tiny_t5()
@@ -927,7 +924,6 @@ class TestSFTTrainer(TrlTestCase):
                 train_dataset=dataset,
             )
 
-    @pytest.mark.skipif(Version(transformers.__version__) < Version("5.0.0"), reason="T5 packing requires v5 masks")
     def test_train_t5_seq2seq_with_packing(self):
         model_id = "trl-internal-testing/tiny-T5ForConditionalGeneration"
         dataset = Dataset.from_list(
@@ -956,7 +952,6 @@ class TestSFTTrainer(TrlTestCase):
         trainer.train()
         assert trainer.state.log_history[-1]["train_loss"] is not None
 
-    @pytest.mark.skipif(Version(transformers.__version__) < Version("5.0.0"), reason="T5 packing requires v5 masks")
     def test_seq2seq_rejects_non_t5_packing_strategy(self):
         model_id = "trl-internal-testing/tiny-T5ForConditionalGeneration"
         dataset = Dataset.from_list([{"prompt": "Translate to German: Hello.", "completion": "Hallo."}])
@@ -967,19 +962,31 @@ class TestSFTTrainer(TrlTestCase):
         with pytest.raises(ValueError, match="only supports `packing_strategy='bfd'`"):
             SFTTrainer(model=model_id, args=training_args, train_dataset=dataset)
 
-    @pytest.mark.skipif(
-        Version(transformers.__version__) >= Version("5.0.0"), reason="Only applies to Transformers 4.x"
-    )
-    def test_t5_seq2seq_packing_requires_transformers_v5(self):
+    def test_t5_seq2seq_packing_restores_encoder_config(self):
         model_id = "trl-internal-testing/tiny-T5ForConditionalGeneration"
-        dataset = Dataset.from_list([{"prompt": "Translate to German: Hello.", "completion": "Hallo."}])
-        training_args = SFTConfig(output_dir=self.tmp_dir, packing=True, bf16=False, report_to="none")
+        model = AutoModelForSeq2SeqLM.from_pretrained(model_id, dtype="float32")
+        collator = DataCollatorForSeq2SeqLanguageModeling(
+            pad_token_id=model.config.pad_token_id,
+            decoder_start_token_id=model.config.decoder_start_token_id,
+        )
+        batch = collator(
+            [
+                {
+                    "input_ids": [5, 6, 7, 8, 9],
+                    "labels": [10, 11, 1, 12, 13, 14, 1],
+                    "encoder_seq_lengths": [3, 2],
+                    "decoder_seq_lengths": [3, 4],
+                }
+            ]
+        )
+        original_is_decoder = model.encoder.config.is_decoder
+        _patch_t5_seq2seq_forward(model)
 
-        with pytest.raises(ValueError, match="requires `transformers>=5.0.0`"):
-            SFTTrainer(model=model_id, args=training_args, train_dataset=dataset)
+        model(**batch)
+
+        assert model.encoder.config.is_decoder is original_is_decoder
 
     @require_peft
-    @pytest.mark.skipif(Version(transformers.__version__) < Version("5.0.0"), reason="T5 packing requires v5 masks")
     def test_train_t5_seq2seq_packing_with_lora_and_gradient_checkpointing(self):
         model_id = "trl-internal-testing/tiny-T5ForConditionalGeneration"
         dataset = Dataset.from_list(
